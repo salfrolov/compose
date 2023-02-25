@@ -1,0 +1,451 @@
+---
+# Source: superset/templates/init-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: superset-init-db
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": "before-hook-creation"
+spec:
+  template:
+    metadata:
+      name: superset-init-db
+    spec:
+      securityContext:
+        runAsUser: 1.00101e+09
+      initContainers:
+      - command:
+        - /bin/sh
+        - -c
+        - until nc -zv $DB_HOST $DB_PORT -w1; do echo 'waiting for db'; sleep 1; done
+        envFrom:
+        - secretRef:
+            name: 'superset-env'
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        name: wait-for-postgres
+      containers:
+      - name: superset-init-db
+        image: "192.168.56.101:5000/repository/docker/superset:1.2.0.53"
+        imagePullPolicy: IfNotPresent
+        envFrom:
+          - secretRef:
+              name: superset-env
+        volumeMounts:
+          - name: superset-config
+            mountPath: "/app/pythonpath"
+            readOnly: true
+        command: ["/bin/sh","-c",". /app/pythonpath/superset_init.sh"]
+        resources:
+          limits:
+            cpu: 300m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+      imagePullSecrets:
+        - name: regcred
+      volumes:
+        - name: superset-config
+          secret:
+            secretName: superset-config
+      restartPolicy: Never
+---
+# Source: superset/templates/secret-superset-config.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: superset-config
+  labels:
+    app: superset
+    chart: superset-0.3.10
+    release: "superset"
+    heritage: "Helm"
+type: Opaque
+stringData:
+  superset_config.py: |
+    
+    import os
+    from cachelib.redis import RedisCache
+    
+    def env(key, default=None):
+        return os.getenv(key, default)
+    
+    REDIS_DB = env('REDIS_DB', '1')
+    MAPBOX_API_KEY = env('MAPBOX_API_KEY', '')
+    CACHE_CONFIG = {
+          'CACHE_TYPE': 'redis',
+          'CACHE_DEFAULT_TIMEOUT': 300,
+          'CACHE_KEY_PREFIX': 'superset_',
+          'CACHE_REDIS_HOST': env('REDIS_HOST'),
+          'CACHE_REDIS_PORT': env('REDIS_PORT'),
+          'CACHE_REDIS_PASSWORD': env('REDIS_PASSWORD'),
+          'CACHE_REDIS_DB': REDIS_DB,
+    }
+    DATA_CACHE_CONFIG = CACHE_CONFIG
+    
+    SQLALCHEMY_DATABASE_URI = f"postgresql+psycopg2://{env('DB_USER')}:{env('DB_PASS')}@{env('DB_HOST')}:{env('DB_PORT')}/{env('DB_NAME')}"
+    SQLALCHEMY_TRACK_MODIFICATIONS = True
+    SECRET_KEY = env('SECRET_KEY', 'NKVJFTUKFVRUJKBHBJDJYCVMBUYBJVHRCHRTYJUYMGBLJBJGHCGNO')
+    
+    # Flask-WTF flag for CSRF
+    WTF_CSRF_ENABLED = True
+    # Add endpoints that need to be exempt from CSRF protection
+    WTF_CSRF_EXEMPT_LIST = []
+    # A CSRF token that expires in 1 year
+    WTF_CSRF_TIME_LIMIT = 60 * 60 * 24 * 365
+    class CeleryConfig(object):
+      BROKER_URL = f"redis://:{env('REDIS_PASSWORD')}@{env('REDIS_HOST')}:{env('REDIS_PORT')}/{REDIS_DB}"
+      CELERY_IMPORTS = ('superset.sql_lab', )
+      CELERY_RESULT_BACKEND = f"redis://:{env('REDIS_PASSWORD')}@{env('REDIS_HOST')}:{env('REDIS_PORT')}/{REDIS_DB}"
+      CELERY_ANNOTATIONS = {'tasks.add': {'rate_limit': '10/s'}}
+    
+    CELERY_CONFIG = CeleryConfig
+    RESULTS_BACKEND = RedisCache(
+          host=env('REDIS_HOST'),
+          port=env('REDIS_PORT'),
+          password=env('REDIS_PASSWORD'),
+          key_prefix='superset_results'
+    )
+    
+    SQLALCHEMY_ENGINE_OPTIONS = {'connect_args': {'options': '-csearch_path=public'}}
+    
+    FEATURE_FLAGS = {
+        "DASHBOARD_NATIVE_FILTERS": True,
+        "ENABLE_TEMPLATE_PROCESSING": True,
+        "ALERT_REPORTS": False,
+        "THUMBNAILS": False,
+        "DASHBOARD_RBAC": True,
+    }
+    
+    APP_NAME = 'SDP Analytics'
+    
+    ENABLE_ALERTS = False
+    ENABLE_SCHEDULED_EMAIL_REPORTS = False
+    
+    LANGUAGES = {
+        "en": {"flag": "us", "name": "English"},
+        "ru": {"flag": "ru", "name": "Russian"},
+    }
+    # ---------------------- AUTH -------------------------
+    from keycloak  import  OIDCSecurityManager
+    from flask_appbuilder.security.manager import AUTH_OID
+    
+    AUTH_TYPE = AUTH_OID
+    OIDC_CLIENT_SECRETS =  '/app/pythonpath/client_secrets.json'
+    OIDC_ID_TOKEN_COOKIE_SECURE = False
+    OIDC_REQUIRE_VERIFIED_EMAIL = False
+    OIDC_OPENID_REALM = 'master'
+    OIDC_INTROSPECTION_AUTH_METHOD = 'client_secret_post'
+    CUSTOM_SECURITY_MANAGER = OIDCSecurityManager
+    AUTH_USER_REGISTRATION = False
+    AUTH_CLIENT_ROLES = ['sdp-analytics-admin', 'sdp-analytics-user', 'admin']
+    # -----------------------------------------------------
+  superset_init.sh: |
+    #!/bin/sh
+    set -eu
+    echo "Upgrading DB schema..."
+    superset db upgrade
+    echo "Initializing roles..."
+    superset init
+    
+    echo "Creating admin user..."
+    superset fab create-admin \
+                    --username admin \
+                    --firstname Superset \
+                    --lastname Admin \
+                    --email admin@superset.com \
+                    --password admin \
+                    || true
+    
+    if [ -f "/import_datasources.yaml" ]; then
+      echo "Importing database connections.... "
+      superset import_datasources -p /import_datasources.yaml
+    fi
+  client_secrets.json: |
+    {
+      "web": {
+        "issuer": "http://192.168.56.101:8080/realms/master",
+        "auth_uri": "http://192.168.56.101:8080/realms/master/protocol/openid-connect/auth",
+        "client_id": "superset",
+        "client_secret": "9oXtbwJvQ0fpszzkXDrjswbU7g1SLWsK",
+        "redirect_uris": [
+          "http://*"
+        ],
+        "userinfo_uri": "http://192.168.56.101:8080/realms/master/protocol/openid-connect/userinfo",
+        "token_uri": "http://192.168.56.101:8080/realms/master/protocol/openid-connect/token",
+        "token_introspection_uri": "http://192.168.56.101:8080/realms/master/protocol/openid-connect/token/introspect"
+      }
+    }
+    
+  keycloak.py: |
+    from flask_appbuilder.security.manager import AUTH_OID
+    from flask import redirect, request, g, current_app
+    from superset.security import SupersetSecurityManager
+    from flask_oidc import OpenIDConnect
+    from flask_appbuilder.security.views import AuthOIDView
+    from flask_login import login_user
+    from urllib.parse import quote
+    from flask_appbuilder.views import ModelView, SimpleFormView, expose
+    import logging
+    
+    class OIDCSecurityManager(SupersetSecurityManager):
+    
+        def __init__(self, appbuilder):
+            super(OIDCSecurityManager, self).__init__(appbuilder)
+            if self.auth_type == AUTH_OID:
+                self.oid = OpenIDConnect(self.appbuilder.get_app)
+            self.authoidview = AuthOIDCView
+    
+    class AuthOIDCView(AuthOIDView):
+    
+        @expose('/login/', methods=['GET', 'POST'])
+        def login(self):
+            sm = self.appbuilder.sm
+            oidc = sm.oid
+            client_id = oidc.client_secrets['client_id']
+    
+            @self.appbuilder.sm.oid.require_login
+            def handle_login():
+                user = sm.find_user(username=oidc.user_getfield('preferred_username'))
+                oidc.validate_token(oidc.get_access_token())
+                roles_ok = False
+                if client_id in g.oidc_token_info["resource_access"]:
+                    for role in current_app.config['AUTH_CLIENT_ROLES']:
+                        if role in g.oidc_token_info["resource_access"][client_id]['roles']:
+                            roles_ok = True
+                            break
+                else:
+                    print('===== NO CLIENT ROLES ===')
+                if user is None or (not user.is_active) or (not roles_ok):
+                    return 'Access denied', 403
+    
+                login_user(user, remember=False)
+                return redirect(self.appbuilder.get_url_for_index)
+    
+            return handle_login()
+    
+        @expose('/logout/', methods=['GET', 'POST'])
+        def logout(self):
+            oidc = self.appbuilder.sm.oid
+    
+            oidc.logout()
+            super(AuthOIDCView, self).logout()
+            redirect_url = request.url_root.strip('/') + self.appbuilder.get_url_for_login
+    
+            return redirect(
+                oidc.client_secrets.get('issuer') + '/protocol/openid-connect/logout?redirect_uri=' + quote(redirect_url))
+---
+# Source: superset/templates/secret-superset-env.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: superset-env
+  labels:
+    app: superset
+    chart: superset-0.3.10
+    release: "superset"
+    heritage: "Helm"
+type: Opaque
+stringData:
+    REDIS_HOST: "superset-redis"
+    DB_HOST: "192.168.56.101"
+    DB_NAME: "sdp"
+    DB_PASS: "9ae32a34"
+    DB_PORT: "5432"
+    DB_USER: "sdp"
+    REDIS_DB: "0"
+    REDIS_PASSWORD: "REDIS_PASSWORD"
+    REDIS_PORT: "6379"
+    SECRET_KEY: "SECRET_KEY"
+    SQLALCHEMY_POSTGRESQL_SCHEMA: "public"
+---
+# Source: superset/templates/service-superset.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: superset-service
+  labels:
+    app: superset-service
+    chart: superset-0.3.10
+    release: superset
+    heritage: Helm
+spec:
+  type: NodePort
+  ports:
+    - port: 8088
+      nodePort: 30088
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: superset
+    release: superset
+---
+# Source: superset/templates/deployment-superset.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superset
+  labels:
+    app: superset
+    chart: superset-0.3.10
+    release: superset
+    heritage: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: superset
+      release: superset
+  template:
+    metadata:
+      annotations:
+        # Force reload on config changes
+        checksum/superset_config.py: e1d4b9eaead9fed23ad351a12f40b55a5df9f2b2d2519195b504e208f74b52d6
+        checksum/superset_init.sh: 74cd948ca57974ed689be5565a5d5d4e10795a82387913c46aee65d29590678c
+        checksum/connections: a39076c351ff5061e19388dbd5166f521ebd38ca7ada88e9a026dbf79c0d8d60
+      labels:
+        app: superset
+        release: superset
+    spec:
+      securityContext:
+        runAsUser: 1.00101e+09
+      initContainers:
+      - command:
+        - /bin/sh
+        - -c
+        - until nc -zv $DB_HOST $DB_PORT -w1; do echo 'waiting for db'; sleep 1; done
+        envFrom:
+        - secretRef:
+            name: 'superset-env'
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        name: wait-for-postgres
+      containers:
+        - name: superset
+          image: "192.168.56.101:5000/repository/docker/superset:1.2.0.53"
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh","-c",". /opt/app-root/bin/docker-entrypoint.sh"]
+          env:
+            - name: "SUPERSET_PORT"
+              value: "8088"
+            - name: "GUNICORN_TIMEOUT"
+              value: "300"
+          envFrom:
+            - secretRef:
+                name: "superset-env"
+          volumeMounts:
+            - name: superset-config
+              mountPath: "/app/pythonpath"
+              readOnly: true
+            #
+          ports:
+            - name: http
+              containerPort: 8088
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 1000m
+              memory: 1Gi
+      imagePullSecrets:
+        - name: regcred
+      volumes:
+        - name: superset-config
+          secret:
+            secretName: superset-config
+        #
+---
+# Source: superset/templates/deployment-worker.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superset-worker
+  labels:
+    app: superset-worker
+    chart: superset-0.3.10
+    release: superset
+    heritage: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: superset-worker
+      release: superset
+  template:
+    metadata:
+      annotations:
+        checksum/superset_config.py: e1d4b9eaead9fed23ad351a12f40b55a5df9f2b2d2519195b504e208f74b52d6
+        checksum/connections: a39076c351ff5061e19388dbd5166f521ebd38ca7ada88e9a026dbf79c0d8d60
+        
+      labels:
+        app: superset-worker
+        release: superset
+    spec:
+      securityContext:
+        runAsUser: 1.00101e+09
+      initContainers:
+      - command:
+        - /bin/sh
+        - -c
+        - until nc -zv $DB_HOST $DB_PORT -w1; do echo 'waiting for db'; sleep 1; done
+        envFrom:
+        - secretRef:
+            name: 'superset-env'
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        name: wait-for-postgres
+      containers:
+        - name: superset
+          image: "192.168.56.101:5000/repository/docker/superset:1.2.0.53"
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh","-c","celery --app=superset.tasks.celery_app:app worker"]
+          env:
+            - name: "SUPERSET_PORT"
+              value: "8088"
+          envFrom:
+            - secretRef:
+                name: "superset-env"
+          volumeMounts:
+            - name: superset-config
+              mountPath: "/app/pythonpath"
+              readOnly: true
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 1000m
+              memory: 1Gi
+      imagePullSecrets:
+        - name: regcred
+      volumes:
+        - name: superset-config
+          secret:
+            secretName: superset-config
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: superset-ingress
+  labels:
+    app: superset
+    chart: superset-0.3.10
+    release: superset
+    heritage: Helm
+spec:
+  rules:
+    - host: "superset-example.test"
+      http:
+        paths:
+          - path: /
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: superset-service
+                port:
+                  number: 8088
