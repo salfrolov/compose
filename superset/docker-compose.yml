@@ -1,0 +1,85 @@
+x-superset-image: &superset-image apache/superset:latest-dev
+x-superset-depends-on:
+  &superset-depends-on
+  - redis
+x-superset-volumes:
+  # /app/pythonpath_docker will be appended to the PYTHONPATH in the final container
+  &superset-volumes
+  - ./docker:/app/docker
+  - ./assets/images/superset-logo-horiz.png:/app/superset/static/assets/images/superset-logo-horiz.png
+  - ./templates/superset/public_welcome.html:/app/superset/templates/superset/public_welcome.html
+  - ./assets/images/favicon.png:/app/superset/static/assets/images/favicon.png
+
+x-superset-environment:
+  &superset-environment
+  - FLASK_ENV=development
+  - SUPERSET_ENV=development
+  - KC_HOST=keycloak
+
+version: "3.7"
+
+volumes:
+  redis:
+    external: false
+  superset_home:
+    external: false
+
+networks:
+  network: 
+    name: external2
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.5.0.0/16
+          gateway: 10.5.0.1 
+
+services:
+  redis:
+    image: redis:latest
+    container_name: superset_cache
+    restart: unless-stopped
+    volumes:
+      - redis:/data
+
+  superset-app:
+    env_file: .env
+    image: *superset-image
+    command: [ "/app/docker/docker-bootstrap.sh", "app-gunicorn" ]
+    user: "root"
+    ports:
+      - $HOST_PORT:$SUPERSET_PORT
+    depends_on: *superset-depends-on
+    volumes: *superset-volumes
+    environment: *superset-environment
+    external_links:
+      - "keycloak:keycloak"
+    networks:
+      network:
+        ipv4_address: 10.5.0.8
+      
+  superset-init:
+    image: *superset-image
+    command: [ "/app/docker/docker-init.sh" ]
+    env_file: .env
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    environment: *superset-environment
+
+  superset-worker:
+    image: *superset-image
+    command: [ "/app/docker/docker-bootstrap.sh", "worker" ]
+    env_file: .env
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    environment: *superset-environment
+
+  superset-worker-beat:
+    image: *superset-image
+    command: [ "/app/docker/docker-bootstrap.sh", "beat" ]
+    env_file: .env
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    environment: *superset-environment
